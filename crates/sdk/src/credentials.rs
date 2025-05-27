@@ -153,7 +153,7 @@ mod native_mod {
     }
 }
 
-#[cfg(feature = "web")]
+#[cfg(all(feature = "web", not(target_os = "emscripten")))]
 mod web_mod {
     pub use gloo_storage::{LocalStorage, SessionStorage, Storage};
 
@@ -308,5 +308,5 @@ mod web_mod {
 #[cfg(not(feature = "web"))]
 pub use native_mod::*;
 
-#[cfg(feature = "web")]
+#[cfg(all(feature = "web", not(target_os = "emscripten")))]
 pub use web_mod::*;

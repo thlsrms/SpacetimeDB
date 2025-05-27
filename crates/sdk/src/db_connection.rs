@@ -600,6 +600,7 @@ impl<M: SpacetimeModule> DbContextImpl<M> {
     #[cfg(feature = "web")]
     pub fn run_background(&self) {
         let this = self.clone();
+        #[cfg(not(target_os = "emscripten"))]
         wasm_bindgen_futures::spawn_local(async move {
             loop {
                 match this.advance_one_message_async().await {
@@ -608,7 +609,20 @@ impl<M: SpacetimeModule> DbContextImpl<M> {
                     Err(e) => panic!("{e:?}"),
                 }
             }
-        })
+        });
+
+        #[cfg(target_os = "emscripten")]
+        std::thread::spawn(move || {
+            futures::executor::block_on(async move {
+                loop {
+                    match this.advance_one_message_async().await {
+                        Ok(()) => (),
+                        Err(e) if error_is_normal_disconnect(&e) => return,
+                        Err(e) => panic!("{e:?}"),
+                    }
+                }
+            });
+        });
     }
 
     /// An async task which does [`Self::advance_one_message_async`] in a loop.
@@ -867,13 +881,13 @@ You must explicitly advance the connection by calling any one of:
 Which of these methods you should call depends on the specific needs of your application,
 but you must call one of them, or else the connection will never progress.
 "]
-    #[cfg(not(feature = "web"))]
+    #[cfg(any(not(feature = "web"), all(feature = "web", target_os = "emscripten")))]
     pub fn build(self) -> crate::Result<M::DbConnection> {
         let imp = self.build_impl()?;
         Ok(<M::DbConnection as DbConnection>::new(imp))
     }
 
-    #[cfg(feature = "web")]
+    #[cfg(all(feature = "web", not(target_os = "emscripten")))]
     pub async fn build(self) -> crate::Result<M::DbConnection> {
         let imp = self.build_impl().await?;
         Ok(<M::DbConnection as DbConnection>::new(imp))
@@ -936,7 +950,56 @@ but you must call one of them, or else the connection will never progress.
         Ok(ctx_imp)
     }
 
-    #[cfg(feature = "web")]
+    #[cfg(all(feature = "web", target_os = "emscripten"))]
+    pub fn build_impl(self) -> crate::Result<DbContextImpl<M>> {
+        let db_callbacks = DbCallbacks::default();
+        let reducer_callbacks = ReducerCallbacks::default();
+
+        let ws_connection = WsConnection::connect(
+            self.uri.unwrap(),
+            self.module_name.as_ref().unwrap(),
+            self.token.as_deref(),
+            get_connection_id(),
+            self.params,
+        )
+        .map_err(|source| crate::Error::FailedToConnect {
+            source: InternalError::new("Failed to initiate WebSocket connection").with_cause(source),
+        })?;
+
+        let (raw_msg_recv, raw_msg_send) = ws_connection.spawn_message_loop();
+        let parsed_recv_chan = spawn_parse_loop::<M>(raw_msg_recv);
+
+        let inner = Arc::new(StdMutex::new(DbContextImplInner {
+            db_callbacks,
+            reducer_callbacks,
+            subscriptions: SubscriptionManager::default(),
+
+            on_connect: self.on_connect,
+            on_connect_error: self.on_connect_error,
+            on_disconnect: self.on_disconnect,
+            call_reducer_flags: <_>::default(),
+        }));
+
+        let mut cache = ClientCache::default();
+        M::register_tables(&mut cache);
+        let cache = Arc::new(StdMutex::new(cache));
+        let send_chan = Arc::new(StdMutex::new(Some(raw_msg_send)));
+
+        let (pending_mutations_send, pending_mutations_recv) = mpsc::unbounded();
+        let ctx_imp = DbContextImpl {
+            inner,
+            send_chan,
+            cache,
+            recv: Arc::new(StdMutex::new(parsed_recv_chan)),
+            pending_mutations_send,
+            pending_mutations_recv: Arc::new(StdMutex::new(pending_mutations_recv)),
+            identity: Arc::new(StdMutex::new(None)),
+        };
+
+        Ok(ctx_imp)
+    }
+
+    #[cfg(all(feature = "web", not(target_os = "emscripten")))]
     pub async fn build_impl(self) -> crate::Result<DbContextImpl<M>> {
         let db_callbacks = DbCallbacks::default();
         let reducer_callbacks = ReducerCallbacks::default();
@@ -1171,7 +1234,13 @@ fn spawn_parse_loop<M: SpacetimeModule>(
     raw_message_recv: mpsc::UnboundedReceiver<ws::ServerMessage<BsatnFormat>>,
 ) -> mpsc::UnboundedReceiver<ParsedMessage<M>> {
     let (parsed_message_send, parsed_message_recv) = mpsc::unbounded();
+    #[cfg(not(target_os = "emscripten"))]
     wasm_bindgen_futures::spawn_local(parse_loop(raw_message_recv, parsed_message_send));
+    #[cfg(target_os = "emscripten")]
+    std::thread::spawn(move || {
+        futures::executor::block_on(parse_loop(raw_message_recv, parsed_message_send));
+    });
+
     parsed_message_recv
 }
 

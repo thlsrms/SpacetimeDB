@@ -13,6 +13,7 @@
 mod callbacks;
 mod client_cache;
 mod db_connection;
+mod emscripten;
 mod metrics;
 mod spacetime_module;
 mod subscription;

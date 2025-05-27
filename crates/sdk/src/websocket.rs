@@ -8,6 +8,8 @@ use std::sync::Arc;
 #[cfg(not(feature = "web"))]
 use std::time::Duration;
 
+#[cfg(all(feature = "web", target_os = "emscripten"))]
+use crate::emscripten::websocket::{Error as EmWsError, Message as WebSocketMessage, WebSocketStream};
 use bytes::Bytes;
 #[cfg(not(feature = "web"))]
 use futures::TryStreamExt;
@@ -30,7 +32,7 @@ use tokio_tungstenite::{
     tungstenite::protocol::{Message as WebSocketMessage, WebSocketConfig},
     MaybeTlsStream, WebSocketStream,
 };
-#[cfg(feature = "web")]
+#[cfg(all(feature = "web", not(target_os = "emscripten")))]
 use tokio_tungstenite_wasm::{Message as WebSocketMessage, WebSocketStream};
 
 use crate::metrics::CLIENT_METRICS;
@@ -70,7 +72,7 @@ pub enum WsError {
         source: Arc<tokio_tungstenite::tungstenite::Error>,
     },
 
-    #[cfg(feature = "web")]
+    #[cfg(all(feature = "web", not(target_os = "emscripten")))]
     #[error("Error in WebSocket connection with {uri}: {source}")]
     Tungstenite {
         uri: Uri,
@@ -102,6 +104,10 @@ pub enum WsError {
     #[cfg(feature = "web")]
     #[error("Token verification error: {0}")]
     TokenVerification(String),
+
+    #[cfg(target_os = "emscripten")]
+    #[error("Emscripten error {0}")]
+    Emscripten(String),
 }
 
 pub(crate) struct WsConnection {
@@ -253,7 +259,7 @@ fn request_insert_auth_header(req: &mut http::Request<()>, token: Option<&str>) 
     }
 }
 
-#[cfg(feature = "web")]
+#[cfg(all(feature = "web", not(target_os = "emscripten")))]
 async fn fetch_ws_token(host: &Uri, auth_token: &str) -> Result<String, WsError> {
     use gloo_net::http::{Method, RequestBuilder};
     use js_sys::{Reflect, JSON};
@@ -334,7 +340,7 @@ impl WsConnection {
         })
     }
 
-    #[cfg(feature = "web")]
+    #[cfg(all(feature = "web", not(target_os = "emscripten")))]
     pub(crate) async fn connect(
         host: Uri,
         db_name: &str,
@@ -355,6 +361,52 @@ impl WsConnection {
                 uri,
                 source: Arc::new(source),
             })?;
+
+        Ok(WsConnection {
+            db_name: db_name.into(),
+            connection_id,
+            sock,
+        })
+    }
+
+    #[cfg(all(feature = "web", target_os = "emscripten"))]
+    pub(crate) fn connect(
+        host: Uri,
+        db_name: &str,
+        token: Option<&str>,
+        connection_id: ConnectionId,
+        params: WsParams,
+    ) -> Result<Self, WsError> {
+        let token = if let Some(auth_token) = token {
+            let url = format!("{}v1/identity/websocket-token", host);
+            let response = crate::emscripten::fetch::Request::new(url)
+                .method("POST")
+                .header("Authorization", &format!("Bearer {auth_token}"))
+                .send_sync();
+            match response {
+                Ok(res) => {
+                    let text_response = res
+                        .text()
+                        .map_err(|err| WsError::TokenVerification(format!("Request Response parsing failed: {err:?}")))?
+                        .into_owned();
+                    println!("websocket-token request text response: {}", text_response);
+                    Some(text_response)
+                }
+                Err(err) => {
+                    return Err(WsError::TokenVerification(format!(
+                        "TokenVerification Request failed {:?}",
+                        err
+                    )))
+                }
+            }
+        } else {
+            None
+        };
+
+        let uri = make_uri(host, db_name, connection_id, params, token.as_deref())?;
+
+        let sock = crate::emscripten::websocket::connect_with_protocols(&uri.to_string(), &[BIN_PROTOCOL])
+            .map_err(|source| WsError::Emscripten(source.to_string()))?;
 
         Ok(WsConnection {
             db_name: db_name.into(),
@@ -394,7 +446,7 @@ impl WsConnection {
         WebSocketMessage::Binary(bsatn::to_vec(&msg).unwrap().into())
     }
 
-    #[cfg(not(feature = "web"))]
+    #[cfg(any(not(feature = "web"), all(feature = "web", target_os = "emscripten")))]
     fn maybe_log_error<T, U: std::fmt::Debug>(cause: &str, res: std::result::Result<T, U>) {
         if let Err(e) = res {
             log::warn!("{}: {:?}", cause, e);
@@ -556,7 +608,103 @@ impl WsConnection {
         (handle, incoming_recv, outgoing_send)
     }
 
-    #[cfg(feature = "web")]
+    #[cfg(all(feature = "web", target_os = "emscripten"))]
+    pub(crate) fn spawn_message_loop(
+        self,
+    ) -> (
+        mpsc::UnboundedReceiver<ServerMessage<BsatnFormat>>,
+        mpsc::UnboundedSender<ClientMessage<Bytes>>,
+    ) {
+        let record_metrics = move |msg_size: usize| {
+            CLIENT_METRICS
+                .websocket_received
+                .with_label_values(&self.db_name, &self.connection_id)
+                .inc();
+            CLIENT_METRICS
+                .websocket_received_msg_size
+                .with_label_values(&self.db_name, &self.connection_id)
+                .observe(msg_size as f64);
+        };
+
+        let (outgoing_tx, outgoing_rx) = mpsc::unbounded::<ClientMessage<Bytes>>();
+        let (incoming_tx, incoming_rx) = mpsc::unbounded::<ServerMessage<BsatnFormat>>();
+
+        let (mut ws_writer, ws_reader) = self.sock.split();
+
+        std::thread::spawn(move || {
+            futures::executor::block_on(async move {
+                let mut incoming = ws_reader.fuse();
+                let mut outgoing = outgoing_rx.fuse();
+
+                loop {
+                    futures::select! {
+                        inbound = incoming.next() => {
+                        match inbound {
+                            Some(Err(EmWsError::ConnectionClosed)) | None => {
+                                eprintln!("Connection closed");
+                                log::info!("Connection closed");
+                                break;
+                            }
+
+                            Some(Ok(WebSocketMessage::Binary(bytes))) => {
+                                record_metrics(bytes.len());
+                                match Self::parse_response(&bytes) {
+                                    Err(e) => Self::maybe_log_error::<(), _>(
+                                        "Error decoding WebSocketMessage::Binary payload",
+                                        Err(e),
+                                    ),
+                                    Ok(msg) => {
+                                            Self::maybe_log_error(
+                                        "Error sending decoded message to incoming_messages queue",
+                                        incoming_tx.unbounded_send(msg),
+                                    )},
+                                }
+                            }
+
+                            Some(Ok(WebSocketMessage::Close(r))) => {
+                                let reason: String = if let Some(r) = r {
+                                    format!("{}:{:?}", r.reason(), r.code())
+                                } else {
+                                    String::default()
+                                };
+                                eprintln!("Connection Closed. {}", reason);
+                                let _ = ws_writer.close().await;
+                                break;
+                            }
+
+                            Some(Err(e)) => {
+                                eprintln!("Error reading message from read WebSocket stream {:?}", e);
+                                break;
+                            }
+
+                            Some(Ok(other)) => {
+                                record_metrics(other.len());
+                                println!("Unexpected WebSocket message {:?}", other);
+                            }
+
+                        }},
+
+                        outbound = outgoing.next() => if let Some(client_msg) = outbound {
+                            let raw = Self::encode_message(client_msg);
+                            if let Err(e) = ws_writer.send(raw).await {
+                                eprintln!("Error sending outgoing message: {e:?}");
+                                break;
+                            }
+                        } else {
+                            if let Err(e) = ws_writer.close().await {
+                                eprintln!("Error sending close frame: {e:?}");
+                            }
+                            break;
+                        },
+                    }
+                }
+            });
+        });
+
+        (incoming_rx, outgoing_tx)
+    }
+
+    #[cfg(all(feature = "web", not(target_os = "emscripten")))]
     pub(crate) fn spawn_message_loop(
         self,
     ) -> (
